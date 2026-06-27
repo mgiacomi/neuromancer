@@ -88,7 +88,7 @@ def main():
     # 2. Split Data: 75% training, 25% testing
     # Using stratify=y keeps target class proportions consistent
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.25, random_state=42, stratify=y
+        X, y, test_size=0.25, stratify=y
     )
     print(f"Split: {X_train.shape[0]} training samples, {X_test.shape[0]} testing samples")
     
@@ -102,7 +102,7 @@ def main():
     input_dim = X_train_scaled.shape[1]
     hidden_dim = 16
     learning_rate = 0.1
-    epochs = 1500
+    epochs = 10000
     
     nn = BreastCancerNN(input_dim=input_dim, hidden_dim=hidden_dim, learning_rate=learning_rate)
     print(f"\nCreated Neural Network: Input Dimension = {input_dim}, Hidden Neurons = {hidden_dim}, LR = {learning_rate}")
