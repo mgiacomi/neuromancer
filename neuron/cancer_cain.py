@@ -87,11 +87,11 @@ v_w2 = [0.0] * num_hidden
 v_b2 = 0.0
 
 # Hyperparameters
-initial_lr = 0.1
-decay_rate = 0.002
-beta = 0.9      # Momentum coefficient
+initial_lr = 0.8
+decay_rate = 0.0005
+beta = 0.7      # Momentum coefficient
 l2_reg = 0.001  # L2 Regularization (Weight Decay)
-epochs = 1000
+epochs = 500
 
 print(f"Loaded {len(raw_data)} samples.")
 print(f"Training set: {len(train_data)} samples, Test set: {len(test_data)} samples.")
