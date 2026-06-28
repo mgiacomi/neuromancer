@@ -45,7 +45,7 @@ import random
 LEARNING_RATE      = 0.003   # SGD learning rate (keep low for stability)
 MOMENTUM           = 0.9     # Nesterov momentum coefficient
 DISCOUNT_FACTOR    = 0.9     # gamma – Bellman discount
-EPOCHS             = 5000  # total training episodes
+EPOCHS             = 50000  # total training episodes
 MINI_BATCH_SIZE    = 50      # replay sample size per update step
 BUFFER_CAPACITY    = 10_000  # max transitions per agent buffer
 
@@ -57,7 +57,7 @@ TARGET_UPDATE_FREQ = 200     # hard-copy target nets every N episodes
 
 GRAD_CLIP          = 0.5     # max L2 norm per gradient matrix
 
-REPORT_FREQ        = 100     # print stats every N epochs
+REPORT_FREQ        = 200     # print stats every N epochs
 
 # Rewards
 REWARD_WIN         =  1.0
@@ -301,32 +301,61 @@ def train():
 
     for epoch in range(1, EPOCHS + 1):
         raw = env.reset()
+        pending = {}    # player -> (state, action, reward_acc)
+        prev_done = False
 
         while not env.done:
-            p   = env.current_player
+            p = env.current_player
             net = net_X    if p == 1 else net_O
             tgt = target_X if p == 1 else target_O
             buf = buf_X    if p == 1 else buf_O
 
-            state  = pov(raw, p)
-            valid  = env.get_valid_actions()
+            # ── Complete this player's pending transition (from 2 moves ago) ──
+            if p in pending:
+                s, a, r_acc = pending.pop(p)
+                ns = pov(raw, p)           # board state when it's NOW this player's turn
+                buf.add(s, a, r_acc, ns, prev_done)
+                if len(buf) >= MINI_BATCH_SIZE:
+                    s_b, a_b, r_b, ns_b, d_b = buf.sample(MINI_BATCH_SIZE)
+                    nq     = tgt.predict_batch(ns_b)
+                    # Deferred 2-step transition: discount by γ² (opponent's move intervenes)
+                    td_tgt = r_b + (1.0 - d_b) * (DISCOUNT_FACTOR ** 2) * np.max(nq, axis=1)
+                    sl     = net.update_batch(s_b, a_b, td_tgt)
+                    if p == 1: blk_lX += sl; blk_sX += 1
+                    else:      blk_lO += sl; blk_sO += 1
+
+            # ── Select and take action ────────────────────────────────────
+            state = pov(raw, p)
+            valid = env.get_valid_actions()
             action = select_action(net, state, valid, epsilon)
-
             nxt_raw, rewards, done, info = env.step(action)
-            reward  = rewards[p]
-            nxt_pov = pov(nxt_raw, p)
 
-            buf.add(state, action, reward, nxt_pov, done)
+            # ── Store as pending (will complete when this player's turn comes again) ──
+            pending[p] = (state, action, rewards[p])
 
-            if len(buf) >= MINI_BATCH_SIZE:
-                s_b, a_b, r_b, ns_b, d_b = buf.sample(MINI_BATCH_SIZE)
-                nq     = tgt.predict_batch(ns_b)
-                td_tgt = r_b + (1.0 - d_b) * DISCOUNT_FACTOR * np.max(nq, axis=1)
-                sl     = net.update_batch(s_b, a_b, td_tgt)
-                if p == 1: blk_lX += sl; blk_sX += 1
-                else:      blk_lO += sl; blk_sO += 1
+            # ── If game ended, complete ALL pending transitions immediately ──
+            if done:
+                for player in list(pending.keys()):
+                    s, a, r_acc = pending.pop(player)
+                    # The player who just acted already has terminal reward in r_acc (1-step)
+                    # The other player's terminal reward happens 1 step later, discount by γ
+                    if player != p:
+                        r_acc += DISCOUNT_FACTOR * rewards[player]
+                    ns = pov(nxt_raw, player)
+                    p_buf = buf_X if player == 1 else buf_O
+                    p_tgt = target_X if player == 1 else target_O
+                    p_net = net_X if player == 1 else net_O
+                    p_buf.add(s, a, r_acc, ns, done)
+                    if len(p_buf) >= MINI_BATCH_SIZE:
+                        s_b, a_b, r_b, ns_b, d_b = p_buf.sample(MINI_BATCH_SIZE)
+                        nq     = p_tgt.predict_batch(ns_b)
+                        td_tgt = r_b + (1.0 - d_b) * DISCOUNT_FACTOR * np.max(nq, axis=1)
+                        sl     = p_net.update_batch(s_b, a_b, td_tgt)
+                        if player == 1: blk_lX += sl; blk_sX += 1
+                        else:          blk_lO += sl; blk_sO += 1
 
             raw = nxt_raw
+            prev_done = done
 
         # Hard-copy target networks periodically
         if epoch % TARGET_UPDATE_FREQ == 0:
