@@ -4,7 +4,7 @@ import torch
 import numpy as np
 from tic_tac_toe_env import TicTacToeEnv
 from dqn_model import DQN
-from train_dqn import train_dqn, evaluate_against_random, select_action
+from train_dqn import train_dqn, evaluate_against_random, select_action, evaluate_self_play
 
 def load_agent(model_path="tick_tac_toe_dqn/dqn_tic_tac_toe.pth"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -89,14 +89,15 @@ def main():
         print("\nChoose an option:")
         print("1. Play against the DQN Agent")
         print("2. Evaluate Agent vs Random Player (100 games)")
-        print("3. Retrain Agent")
-        print("4. Exit")
+        print("3. Evaluate Agent vs Self (100 games, no epsilon)")
+        print("4. Retrain Agent")
+        print("5. Exit")
         
-        choice = input("Enter choice (1-4): ").strip()
+        choice = input("Enter choice (1-5): ").strip()
         if choice == '1':
             play_vs_agent(agent, device)
         elif choice == '2':
-            print("Evaluating agent...")
+            print("Evaluating agent vs Random...")
             wins, draws, losses = evaluate_against_random(agent, device, num_games=100)
             print(f"\nEvaluation Results (100 games):")
             print(f"Wins:   {wins:3d}%")
@@ -104,15 +105,23 @@ def main():
             print(f"Losses: {losses:3d}%")
             print(f"Win/Draw Rate: {wins + draws}%")
         elif choice == '3':
+            print("Evaluating agent vs Self...")
+            wins_X, wins_O, draws = evaluate_self_play(agent, device, num_games=100)
+            print(f"\nSelf-Play Results (100 games):")
+            print(f"X Wins: {wins_X:3d}%")
+            print(f"O Wins: {wins_O:3d}%")
+            print(f"Draws:  {draws:3d}%")
+            print(f"Tie Rate: {draws}%")
+        elif choice == '4':
             confirm = input("Are you sure you want to retrain the agent? This will overwrite the existing model. [y/n]: ").strip().lower()
             if confirm == 'y':
                 agent = train_dqn(num_episodes=5000, save_path=model_path)
                 agent, device = load_agent(model_path)
-        elif choice == '4':
+        elif choice == '5':
             print("Goodbye!")
             break
         else:
-            print("Invalid choice. Please choose from 1 to 4.")
+            print("Invalid choice. Please choose from 1 to 5.")
 
 if __name__ == "__main__":
     main()

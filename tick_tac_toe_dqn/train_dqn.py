@@ -27,7 +27,6 @@ def select_action(state, policy_net, epsilon, device):
 
 def train_dqn(num_episodes=5000, save_path="tick_tac_toe_dqn/dqn_tic_tac_toe.pth"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training on device: {device}")
     
     policy_net = DQN().to(device)
     target_net = DQN().to(device)
@@ -46,6 +45,24 @@ def train_dqn(num_episodes=5000, save_path="tick_tac_toe_dqn/dqn_tic_tac_toe.pth
     eps_end = 0.05
     eps_decay = 0.9992  # Over 5000 episodes
     epsilon = eps_start
+    
+    # Reporting parameters
+    REPORT_FREQ = 200
+    blk_wins_X = 0
+    blk_wins_O = 0
+    blk_ties = 0
+    blk_loss = 0.0
+    blk_loss_count = 0
+    
+    sep = "=" * 77
+    print(sep)
+    print("  Self-Play DQN  -  Tic Tac Toe (converging to ties)")
+    print(f"  Epochs={num_episodes}  gamma={gamma}  lr={optimizer.defaults['lr']}  TargetSync every {target_update_freq} eps")
+    print(f"  Batch={batch_size}  Device={device}")
+    print(f"  REWARD: Win=10.0  Tie=2.0  Lose=-10.0")
+    print(sep)
+    print(f"{'Epoch':>8}  {'Eps':>6}  {'X Wins':>7}  {'O Wins':>7}  {'Ties':>6}  {'Tie%':>6}  {'Avg Loss':>10}")
+    print("-" * 77)
     
     for episode in range(1, num_episodes + 1):
         env = TicTacToeEnv()
@@ -121,6 +138,18 @@ def train_dqn(num_episodes=5000, save_path="tick_tac_toe_dqn/dqn_tic_tac_toe.pth
                 loss.backward()
                 optimizer.step()
                 
+                blk_loss += loss.item()
+                blk_loss_count += 1
+                
+        # Track training game outcomes
+        w = info.get("winner")
+        if w == 1:
+            blk_wins_X += 1
+        elif w == -1:
+            blk_wins_O += 1
+        elif info.get("draw"):
+            blk_ties += 1
+            
         # Decay epsilon
         epsilon = max(eps_end, epsilon * eps_decay)
         
@@ -128,10 +157,24 @@ def train_dqn(num_episodes=5000, save_path="tick_tac_toe_dqn/dqn_tic_tac_toe.pth
         if episode % target_update_freq == 0:
             target_net.load_state_dict(policy_net.state_dict())
             
+        if episode % REPORT_FREQ == 0:
+            total = blk_wins_X + blk_wins_O + blk_ties
+            pct = 100.0 * blk_ties / max(total, 1)
+            avg_loss = blk_loss / max(blk_loss_count, 1)
+            print(
+                f"{episode:>8}  {epsilon:>6.4f}  "
+                f"{blk_wins_X:>7}  {blk_wins_O:>7}  {blk_ties:>6}  {pct:>5.1f}%  "
+                f"{avg_loss:>10.5f}"
+            )
+            blk_wins_X = blk_wins_O = blk_ties = 0
+            blk_loss = 0.0
+            blk_loss_count = 0
+            
         if episode % 500 == 0:
             # Run a quick evaluation
             win, draw, loss = evaluate_against_random(policy_net, device, num_games=100)
-            print(f"Episode {episode:4d} | Eps: {epsilon:.3f} | Eval vs Random (100 games): Win {win}%, Draw {draw}%, Loss {loss}%")
+            print(f"  [Eval vs Random] (100 games): Win {win}%, Draw {draw}%, Loss {loss}%")
+            print("-" * 77)
             
     # Save trained policy
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -172,6 +215,36 @@ def evaluate_against_random(policy_net, device, num_games=100):
                     
     policy_net.train()
     return wins, draws, losses
+
+def evaluate_self_play(policy_net, device, num_games=100):
+    policy_net.eval()
+    wins_X, wins_O, draws = 0, 0, 0
+    
+    for game in range(num_games):
+        env = TicTacToeEnv()
+        state = env.reset()
+        
+        done = False
+        while not done:
+            curr_player = env.current_player
+            state_p = state * curr_player
+            action = select_action(state_p, policy_net, 0.0, device)
+            if action is None:
+                break
+                
+            state, reward, done, info = env.step(action)
+            
+            if done:
+                winner = info.get("winner")
+                if winner == 1:
+                    wins_X += 1
+                elif winner == -1:
+                    wins_O += 1
+                elif info.get("draw"):
+                    draws += 1
+                    
+    policy_net.train()
+    return wins_X, wins_O, draws
 
 if __name__ == "__main__":
     train_dqn()
