@@ -7,8 +7,8 @@ via self-play, converging toward optimal play (ties).
 Architecture
 ------------
   Input  : 9 neurons  (board from agent's own perspective)
-  Hidden1: 16 neurons (ReLU)
-  Hidden2: 16 neurons (ReLU)
+  Hidden1: 64 neurons (ReLU)
+  Hidden2: 64 neurons (ReLU)
   Output :  9 neurons (Q-values, one per board cell)
 
 Key design choices that drive convergence toward ties
@@ -45,7 +45,7 @@ import random
 LEARNING_RATE      = 0.003   # SGD learning rate (keep low for stability)
 MOMENTUM           = 0.9     # Nesterov momentum coefficient
 DISCOUNT_FACTOR    = 0.9     # gamma – Bellman discount
-EPOCHS             = 50000  # total training episodes
+EPOCHS             = 10000  # total training episodes
 MINI_BATCH_SIZE    = 50      # replay sample size per update step
 BUFFER_CAPACITY    = 10_000  # max transitions per agent buffer
 
@@ -66,8 +66,8 @@ REWARD_TIE         =  1.0    # equal to winning – key incentive for draws
 REWARD_STEP        =  0.0
 REWARD_ILLEGAL     = -5.0
 
-HIDDEN_SIZE_1      = 16
-HIDDEN_SIZE_2      = 16
+HIDDEN_SIZE_1      = 64
+HIDDEN_SIZE_2      = 64
 INPUT_SIZE         = 9
 OUTPUT_SIZE        = 9
 # ============================================================
@@ -111,7 +111,7 @@ class ReplayBuffer:
 # ------------------------------------------------------------
 class DQNetwork:
     """
-    input(9) -> ReLU(16) -> ReLU(16) -> linear(9)
+    input(9) -> ReLU(64) -> ReLU(64) -> linear(9)
     """
 
     def __init__(self, lr=LEARNING_RATE, momentum=MOMENTUM):
@@ -310,49 +310,47 @@ def train():
             tgt = target_X if p == 1 else target_O
             buf = buf_X    if p == 1 else buf_O
 
-            # ── Complete this player's pending transition (from 2 moves ago) ──
-            if p in pending:
-                s, a, r_acc = pending.pop(p)
-                ns = pov(raw, p)           # board state when it's NOW this player's turn
-                buf.add(s, a, r_acc, ns, prev_done)
-                if len(buf) >= MINI_BATCH_SIZE:
-                    s_b, a_b, r_b, ns_b, d_b = buf.sample(MINI_BATCH_SIZE)
-                    nq     = tgt.predict_batch(ns_b)
-                    # Deferred 2-step transition: discount by γ² (opponent's move intervenes)
-                    td_tgt = r_b + (1.0 - d_b) * (DISCOUNT_FACTOR ** 2) * np.max(nq, axis=1)
-                    sl     = net.update_batch(s_b, a_b, td_tgt)
-                    if p == 1: blk_lX += sl; blk_sX += 1
-                    else:      blk_lO += sl; blk_sO += 1
-
             # ── Select and take action ────────────────────────────────────
             state = pov(raw, p)
             valid = env.get_valid_actions()
             action = select_action(net, state, valid, epsilon)
             nxt_raw, rewards, done, info = env.step(action)
 
-            # ── Store as pending (will complete when this player's turn comes again) ──
+            # ── Store current player's pending ────────────────────────────
             pending[p] = (state, action, rewards[p])
 
-            # ── If game ended, complete ALL pending transitions immediately ──
+            # ── Complete OTHER player's pending now that they've seen our response ──
+            other = -p
+            if other in pending:
+                s_o, a_o, r_acc_o = pending.pop(other)
+                other_buf = buf_X if other == 1 else buf_O
+                other_tgt = target_X if other == 1 else target_O
+                other_net = net_X if other == 1 else net_O
+                # r_acc_o is other's own step reward; rewards[other] is their outcome
+                r_combined = r_acc_o + DISCOUNT_FACTOR * rewards[other]
+                ns_o = pov(nxt_raw, other)  # board after our action, from other's perspective
+                other_buf.add(s_o, a_o, r_combined, ns_o, done)
+                if len(other_buf) >= MINI_BATCH_SIZE:
+                    s_b, a_b, r_b, ns_b, d_b = other_buf.sample(MINI_BATCH_SIZE)
+                    nq     = other_tgt.predict_batch(ns_b)
+                    # 2-step transition: r_t + γ·r_{t+1} is already in r_b, bootstrap the rest
+                    td_tgt = r_b + (1.0 - d_b) * (DISCOUNT_FACTOR ** 2) * np.max(nq, axis=1)
+                    sl     = other_net.update_batch(s_b, a_b, td_tgt)
+                    if other == 1: blk_lX += sl; blk_sX += 1
+                    else:          blk_lO += sl; blk_sO += 1
+
+            # ── If game ended, complete current player's pending with terminal reward ──
             if done:
-                for player in list(pending.keys()):
-                    s, a, r_acc = pending.pop(player)
-                    # The player who just acted already has terminal reward in r_acc (1-step)
-                    # The other player's terminal reward happens 1 step later, discount by γ
-                    if player != p:
-                        r_acc += DISCOUNT_FACTOR * rewards[player]
-                    ns = pov(nxt_raw, player)
-                    p_buf = buf_X if player == 1 else buf_O
-                    p_tgt = target_X if player == 1 else target_O
-                    p_net = net_X if player == 1 else net_O
-                    p_buf.add(s, a, r_acc, ns, done)
-                    if len(p_buf) >= MINI_BATCH_SIZE:
-                        s_b, a_b, r_b, ns_b, d_b = p_buf.sample(MINI_BATCH_SIZE)
-                        nq     = p_tgt.predict_batch(ns_b)
-                        td_tgt = r_b + (1.0 - d_b) * DISCOUNT_FACTOR * np.max(nq, axis=1)
-                        sl     = p_net.update_batch(s_b, a_b, td_tgt)
-                        if player == 1: blk_lX += sl; blk_sX += 1
-                        else:          blk_lO += sl; blk_sO += 1
+                s_p, a_p, r_acc_p = pending.pop(p)
+                ns_p = pov(nxt_raw, p)
+                buf.add(s_p, a_p, r_acc_p, ns_p, done)
+                if len(buf) >= MINI_BATCH_SIZE:
+                    s_b, a_b, r_b, ns_b, d_b = buf.sample(MINI_BATCH_SIZE)
+                    nq     = tgt.predict_batch(ns_b)
+                    td_tgt = r_b + (1.0 - d_b) * (DISCOUNT_FACTOR ** 2) * np.max(nq, axis=1)
+                    sl     = net.update_batch(s_b, a_b, td_tgt)
+                    if p == 1: blk_lX += sl; blk_sX += 1
+                    else:      blk_lO += sl; blk_sO += 1
 
             raw = nxt_raw
             prev_done = done
