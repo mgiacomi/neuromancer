@@ -2,25 +2,36 @@
 Dual-Agent Deep Q-Network (DQN) for Tic Tac Toe
 =================================================
 Two independent DQN agents (X and O) train against each other
-via self-play. Each agent has its own online network, target
-network, and replay buffer.
+via self-play, converging toward optimal play (ties).
 
 Architecture
 ------------
-  Input  : 9 neurons  (board state)
+  Input  : 9 neurons  (board from agent's own perspective)
   Hidden1: 16 neurons (ReLU)
   Hidden2: 16 neurons (ReLU)
   Output :  9 neurons (Q-values, one per board cell)
 
-Key features
-------------
-  - Xavier / Glorot uniform weight initialisation
-  - Nesterov momentum SGD (applied per mini-batch)
-  - Independent experience-replay buffers per agent
-  - Action masking (only legal moves are considered)
-  - Target networks updated every TARGET_UPDATE_FREQ epochs
-  - Epsilon-greedy exploration with multiplicative decay
-  - Per-50-epoch console reports: wins, losses, ties, avg MSE
+Key design choices that drive convergence toward ties
+-----------------------------------------------------
+1. PERSPECTIVE NORMALISATION
+   Each agent always sees itself as +1. Player O multiplies
+   the board by -1 so its own pieces read +1. Both agents
+   therefore learn the SAME abstract game strategy, which
+   naturally converges to a symmetric, tie-heavy policy.
+
+2. TIE REWARD = WIN REWARD
+   By giving a draw the same reward as a win, the agents have
+   no incentive to take risks; they learn to force draws.
+
+3. GRADIENT CLIPPING  (per-layer L2 norm clamping)
+   Prevents the loss explosion seen in earlier runs.
+
+4. HARD TARGET-NETWORK COPIES every TARGET_UPDATE_FREQ episodes
+   Stable, proven approach — avoids Polyak accumulation issues.
+
+5. LOW, FIXED LEARNING RATE  (no velocity-runaway from annealing)
+
+6. SLOW EPSILON DECAY  (agents keep exploring until late training)
 """
 
 import numpy as np
@@ -31,20 +42,32 @@ import random
 # ============================================================
 #  HYPERPARAMETERS  –  edit everything here
 # ============================================================
-LEARNING_RATE      = 0.07    # SGD learning rate
+LEARNING_RATE      = 0.003   # SGD learning rate (keep low for stability)
 MOMENTUM           = 0.9     # Nesterov momentum coefficient
 DISCOUNT_FACTOR    = 0.9     # gamma – Bellman discount
-EPOCHS             = 5000    # total training episodes
+EPOCHS             = 5000  # total training episodes
 MINI_BATCH_SIZE    = 50      # replay sample size per update step
 BUFFER_CAPACITY    = 10_000  # max transitions per agent buffer
-EPSILON_START      = 1.0     # initial exploration rate
-EPSILON_MIN        = 0.05    # floor for epsilon
-EPSILON_DECAY      = 0.9995  # multiplicative decay per epoch
-TARGET_UPDATE_FREQ = 50      # sync target networks every N epochs
-REPORT_FREQ        = 100      # print stats every N epochs
 
-HIDDEN_SIZE_1      = 16      # neurons in hidden layer 1
-HIDDEN_SIZE_2      = 16      # neurons in hidden layer 2
+EPSILON_START      = 1.0     # initial exploration rate
+EPSILON_MIN        = 0.01    # floor for epsilon (agents exploit late)
+EPSILON_DECAY      = 0.9997  # slow decay; ε≈0.05 around epoch 9k
+
+TARGET_UPDATE_FREQ = 200     # hard-copy target nets every N episodes
+
+GRAD_CLIP          = 0.5     # max L2 norm per gradient matrix
+
+REPORT_FREQ        = 100     # print stats every N epochs
+
+# Rewards
+REWARD_WIN         =  1.0
+REWARD_LOSE        = -1.0
+REWARD_TIE         =  1.0    # equal to winning – key incentive for draws
+REWARD_STEP        =  0.0
+REWARD_ILLEGAL     = -5.0
+
+HIDDEN_SIZE_1      = 16
+HIDDEN_SIZE_2      = 16
 INPUT_SIZE         = 9
 OUTPUT_SIZE        = 9
 # ============================================================
@@ -61,22 +84,22 @@ class ReplayBuffer:
 
     def add(self, state, action, reward, next_state, done):
         self.buffer.append((
-            np.array(state,      dtype=np.float64),
+            np.array(state,      dtype=np.float32),
             int(action),
             float(reward),
-            np.array(next_state, dtype=np.float64),
+            np.array(next_state, dtype=np.float32),
             float(done),
         ))
 
     def sample(self, batch_size: int):
         batch = random.sample(self.buffer, batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
+        s, a, r, ns, d = zip(*batch)
         return (
-            np.array(states,      dtype=np.float64),
-            np.array(actions,     dtype=np.int32),
-            np.array(rewards,     dtype=np.float64),
-            np.array(next_states, dtype=np.float64),
-            np.array(dones,       dtype=np.float64),
+            np.array(s,  dtype=np.float32),
+            np.array(a,  dtype=np.int32),
+            np.array(r,  dtype=np.float32),
+            np.array(ns, dtype=np.float32),
+            np.array(d,  dtype=np.float32),
         )
 
     def __len__(self):
@@ -84,162 +107,98 @@ class ReplayBuffer:
 
 
 # ------------------------------------------------------------
-#  Neural Network – 2 hidden layers, Xavier init,
-#  Nesterov momentum SGD
+#  Neural Network  (Xavier init + Nesterov SGD + grad clip)
 # ------------------------------------------------------------
 class DQNetwork:
     """
-    Feedforward network: input(9) -> hidden(16) -> hidden(16) -> output(9).
-
-    Activation : ReLU on both hidden layers; linear output.
-    Init        : Xavier / Glorot uniform.
-    Optimiser   : Nesterov-momentum SGD.
+    input(9) -> ReLU(16) -> ReLU(16) -> linear(9)
     """
 
-    def __init__(
-        self,
-        input_size:   int   = INPUT_SIZE,
-        hidden1_size: int   = HIDDEN_SIZE_1,
-        hidden2_size: int   = HIDDEN_SIZE_2,
-        output_size:  int   = OUTPUT_SIZE,
-        lr:           float = LEARNING_RATE,
-        momentum:     float = MOMENTUM,
-    ):
+    def __init__(self, lr=LEARNING_RATE, momentum=MOMENTUM):
         self.lr       = lr
         self.momentum = momentum
 
-        # --- Xavier / Glorot uniform initialisation ---
-        # limit = sqrt(6 / (fan_in + fan_out))
         def xavier(fan_in, fan_out):
             lim = np.sqrt(6.0 / (fan_in + fan_out))
-            return np.random.uniform(-lim, lim, (fan_in, fan_out))
+            return np.random.uniform(-lim, lim, (fan_in, fan_out)).astype(np.float32)
 
-        self.W1 = xavier(input_size,   hidden1_size)
-        self.b1 = np.zeros(hidden1_size)
-        self.W2 = xavier(hidden1_size, hidden2_size)
-        self.b2 = np.zeros(hidden2_size)
-        self.W3 = xavier(hidden2_size, output_size)
-        self.b3 = np.zeros(output_size)
+        self.W1 = xavier(INPUT_SIZE,   HIDDEN_SIZE_1)
+        self.b1 = np.zeros(HIDDEN_SIZE_1, dtype=np.float32)
+        self.W2 = xavier(HIDDEN_SIZE_1, HIDDEN_SIZE_2)
+        self.b2 = np.zeros(HIDDEN_SIZE_2, dtype=np.float32)
+        self.W3 = xavier(HIDDEN_SIZE_2, OUTPUT_SIZE)
+        self.b3 = np.zeros(OUTPUT_SIZE, dtype=np.float32)
 
-        # --- Nesterov momentum velocity terms ---
-        self.vW1 = np.zeros_like(self.W1)
-        self.vb1 = np.zeros_like(self.b1)
-        self.vW2 = np.zeros_like(self.W2)
-        self.vb2 = np.zeros_like(self.b2)
-        self.vW3 = np.zeros_like(self.W3)
-        self.vb3 = np.zeros_like(self.b3)
+        # Nesterov velocity terms
+        self.vW1 = np.zeros_like(self.W1); self.vb1 = np.zeros_like(self.b1)
+        self.vW2 = np.zeros_like(self.W2); self.vb2 = np.zeros_like(self.b2)
+        self.vW3 = np.zeros_like(self.W3); self.vb3 = np.zeros_like(self.b3)
 
-        # Cached activations for backprop
-        self.x_in = None
-        self.z1 = self.a1 = None
-        self.z2 = self.a2 = None
-        self.z3 = None
+        self.x_in = self.z1 = self.a1 = self.z2 = self.a2 = None
 
     # ── activations ──────────────────────────────────────────
     @staticmethod
-    def relu(x):
-        return np.maximum(0.0, x)
+    def relu(x):      return np.maximum(0.0, x)
+    @staticmethod
+    def relu_d(z):    return (z > 0).astype(np.float32)
 
     @staticmethod
-    def relu_grad(z):
-        return (z > 0).astype(np.float64)
+    def _clip(g, c=GRAD_CLIP):
+        n = np.linalg.norm(g)
+        return g * (c / n) if n > c else g
 
-    # ── forward pass ─────────────────────────────────────────
-    def forward(self, x: np.ndarray) -> np.ndarray:
-        """x: shape (batch, 9) or (9,)"""
+    # ── forward ──────────────────────────────────────────────
+    def forward(self, x):
         self.x_in = x
-        self.z1   = x  @ self.W1 + self.b1
-        self.a1   = self.relu(self.z1)
-        self.z2   = self.a1 @ self.W2 + self.b2
-        self.a2   = self.relu(self.z2)
-        self.z3   = self.a2 @ self.W3 + self.b3  # linear output
-        return self.z3
+        self.z1 = x @ self.W1 + self.b1; self.a1 = self.relu(self.z1)
+        self.z2 = self.a1 @ self.W2 + self.b2; self.a2 = self.relu(self.z2)
+        return self.a2 @ self.W3 + self.b3
 
-    def predict(self, state: np.ndarray) -> np.ndarray:
-        """Q-values for a single board state, shape (9,)."""
-        return self.forward(state.reshape(1, -1))[0]
+    def predict(self, state):
+        return self.forward(state.reshape(1, -1).astype(np.float32))[0]
 
-    def predict_batch(self, states: np.ndarray) -> np.ndarray:
-        """Q-values for a batch, shape (B, 9)."""
-        return self.forward(states)
+    def predict_batch(self, states):
+        return self.forward(states.astype(np.float32))
 
     # ── Nesterov look-ahead helpers ───────────────────────────
-    def _look_ahead(self):
-        """Move weights to look-ahead point; save originals."""
-        self._W1s = self.W1.copy(); self.W1 = self.W1 + self.momentum * self.vW1
-        self._b1s = self.b1.copy(); self.b1 = self.b1 + self.momentum * self.vb1
-        self._W2s = self.W2.copy(); self.W2 = self.W2 + self.momentum * self.vW2
-        self._b2s = self.b2.copy(); self.b2 = self.b2 + self.momentum * self.vb2
-        self._W3s = self.W3.copy(); self.W3 = self.W3 + self.momentum * self.vW3
-        self._b3s = self.b3.copy(); self.b3 = self.b3 + self.momentum * self.vb3
+    def _look(self):
+        m = self.momentum
+        self._W1s = self.W1.copy(); self.W1 = self.W1 + m * self.vW1
+        self._b1s = self.b1.copy(); self.b1 = self.b1 + m * self.vb1
+        self._W2s = self.W2.copy(); self.W2 = self.W2 + m * self.vW2
+        self._b2s = self.b2.copy(); self.b2 = self.b2 + m * self.vb2
+        self._W3s = self.W3.copy(); self.W3 = self.W3 + m * self.vW3
+        self._b3s = self.b3.copy(); self.b3 = self.b3 + m * self.vb3
 
     def _restore(self):
-        """Restore original weights after gradient computation."""
         self.W1 = self._W1s; self.b1 = self._b1s
         self.W2 = self._W2s; self.b2 = self._b2s
         self.W3 = self._W3s; self.b3 = self._b3s
 
-    # ── mini-batch Nesterov SGD update ────────────────────────
-    def update_batch(
-        self,
-        states:  np.ndarray,   # (B, 9)
-        actions: np.ndarray,   # (B,)
-        targets: np.ndarray,   # (B,)
-    ) -> float:
-        """
-        One mini-batch gradient step with Nesterov momentum.
-        Loss = mean( (Q(s,a) - target)^2 )
-        Returns scalar MSE loss for logging.
-        """
+    # ── mini-batch update ─────────────────────────────────────
+    def update_batch(self, states, actions, targets) -> float:
         B = len(states)
-
-        # 1. Move to look-ahead point
-        self._look_ahead()
-
-        # 2. Forward pass at look-ahead position
-        q_all = self.forward(states)          # (B, 9)
-
-        # 3. Build target matrix – only the chosen action changes
-        q_tgt = q_all.copy()
-        q_tgt[np.arange(B), actions] = targets
-
-        # 4. MSE loss and output-layer gradient
-        diff = q_all - q_tgt                  # (B, 9)
-        loss = float(np.mean(diff ** 2))
-        dz3  = (2.0 / B) * diff              # (B, 9)
-
-        # 5. Layer 3 gradients
-        dW3 = self.a2.T @ dz3               # (16, 9)
-        db3 = dz3.sum(axis=0)               # (9,)
-        da2 = dz3 @ self.W3.T              # (B, 16)
-
-        # 6. Layer 2 gradients (ReLU)
-        dz2 = da2 * self.relu_grad(self.z2) # (B, 16)
-        dW2 = self.a1.T @ dz2              # (16, 16)
-        db2 = dz2.sum(axis=0)              # (16,)
-        da1 = dz2 @ self.W2.T             # (B, 16)
-
-        # 7. Layer 1 gradients (ReLU)
-        dz1 = da1 * self.relu_grad(self.z1) # (B, 16)
-        dW1 = self.x_in.T @ dz1            # (9, 16)
-        db1 = dz1.sum(axis=0)              # (16,)
-
-        # 8. Restore original weights
+        self._look()
+        q   = self.forward(states)
+        qt  = q.copy(); qt[np.arange(B), actions] = targets
+        d   = q - qt
+        loss = float(np.mean(d ** 2))
+        dz3 = (2.0 / B) * d
+        dW3 = self._clip(self.a2.T @ dz3); db3 = self._clip(dz3.sum(0))
+        da2 = dz3 @ self.W3.T
+        dz2 = da2 * self.relu_d(self.z2)
+        dW2 = self._clip(self.a1.T @ dz2); db2 = self._clip(dz2.sum(0))
+        da1 = dz2 @ self.W2.T
+        dz1 = da1 * self.relu_d(self.z1)
+        dW1 = self._clip(self.x_in.T @ dz1); db1 = self._clip(dz1.sum(0))
         self._restore()
-
-        # 9. Nesterov velocity update
-        self.vW3 = self.momentum * self.vW3 - self.lr * dW3
-        self.vb3 = self.momentum * self.vb3 - self.lr * db3
-        self.vW2 = self.momentum * self.vW2 - self.lr * dW2
-        self.vb2 = self.momentum * self.vb2 - self.lr * db2
-        self.vW1 = self.momentum * self.vW1 - self.lr * dW1
-        self.vb1 = self.momentum * self.vb1 - self.lr * db1
-
-        # 10. Parameter update
-        self.W3 += self.vW3; self.b3 += self.vb3
-        self.W2 += self.vW2; self.b2 += self.vb2
-        self.W1 += self.vW1; self.b1 += self.vb1
-
+        lr = self.lr; m = self.momentum
+        self.vW3 = m*self.vW3 - lr*dW3; self.W3 += self.vW3
+        self.vb3 = m*self.vb3 - lr*db3; self.b3 += self.vb3
+        self.vW2 = m*self.vW2 - lr*dW2; self.W2 += self.vW2
+        self.vb2 = m*self.vb2 - lr*db2; self.b2 += self.vb2
+        self.vW1 = m*self.vW1 - lr*dW1; self.W1 += self.vW1
+        self.vb1 = m*self.vb1 - lr*db1; self.b1 += self.vb1
         return loss
 
 
@@ -247,92 +206,69 @@ class DQNetwork:
 #  Tic Tac Toe Environment
 # ------------------------------------------------------------
 class TicTacToeEnv:
-    """
-    Board: list of 9 ints.
-      0  = empty
-      1  = X  (first player)
-     -1  = O  (second player)
-    """
-
     WIN_COMBOS = [
-        [0, 1, 2], [3, 4, 5], [6, 7, 8],  # rows
-        [0, 3, 6], [1, 4, 7], [2, 5, 8],  # columns
-        [0, 4, 8], [2, 4, 6],              # diagonals
+        [0,1,2],[3,4,5],[6,7,8],
+        [0,3,6],[1,4,7],[2,5,8],
+        [0,4,8],[2,4,6],
     ]
 
-    def reset(self) -> np.ndarray:
+    def reset(self):
         self.board          = [0] * 9
-        self.current_player = 1   # X goes first
+        self.current_player = 1
         self.done           = False
         self.winner         = None
-        return np.array(self.board, dtype=np.float64)
+        return np.array(self.board, dtype=np.float32)
 
-    def get_valid_actions(self) -> list:
+    def get_valid_actions(self):
         return [i for i, v in enumerate(self.board) if v == 0]
 
     def check_winner(self):
         b = self.board
         for c in self.WIN_COMBOS:
             s = b[c[0]] + b[c[1]] + b[c[2]]
-            if s ==  3: return  1  # X wins
-            if s == -3: return -1  # O wins
-        if 0 not in b:
-            return 0   # tie
-        return None    # game still in progress
+            if s ==  3: return  1
+            if s == -3: return -1
+        if 0 not in b: return 0
+        return None
 
-    def step(self, action: int):
-        """
-        Returns
-        -------
-        next_state : np.ndarray (9,)
-        rewards    : dict  { player_id: float }
-        done       : bool
-        info       : dict
-        """
+    def step(self, action):
         if self.done:
-            raise RuntimeError("Game is over. Call reset().")
-
-        # Illegal move: penalise and end game
+            raise RuntimeError("Call reset().")
         if action < 0 or action > 8 or self.board[action] != 0:
-            rewards    = {self.current_player: -10.0, -self.current_player: 0.0}
-            self.done  = True
-            return np.array(self.board, dtype=np.float64), rewards, True, {"winner": None}
-
+            self.done = True
+            return (np.array(self.board, dtype=np.float32),
+                    {self.current_player: REWARD_ILLEGAL, -self.current_player: 0.0},
+                    True, {"winner": None})
         self.board[action] = self.current_player
-        self.winner        = self.check_winner()
-
+        self.winner = self.check_winner()
         if self.winner is not None:
             self.done = True
-            if   self.winner ==  1: rewards = {1:  1.0, -1: -1.0}
-            elif self.winner == -1: rewards = {1: -1.0, -1:  1.0}
-            else:                   rewards = {1:  0.5, -1:  0.5}  # tie
+            if   self.winner ==  1: r = {1: REWARD_WIN,  -1: REWARD_LOSE}
+            elif self.winner == -1: r = {1: REWARD_LOSE, -1: REWARD_WIN}
+            else:                   r = {1: REWARD_TIE,  -1: REWARD_TIE}
         else:
-            rewards             = {1: 0.0, -1: 0.0}
+            r = {1: REWARD_STEP, -1: REWARD_STEP}
             self.current_player = -self.current_player
+        return np.array(self.board, dtype=np.float32), r, self.done, {"winner": self.winner}
 
-        return np.array(self.board, dtype=np.float64), rewards, self.done, {"winner": self.winner}
+
+# ------------------------------------------------------------
+#  Perspective normalisation
+#  Each agent always sees itself as +1.
+# ------------------------------------------------------------
+def pov(board: np.ndarray, player: int) -> np.ndarray:
+    return board * player
 
 
 # ------------------------------------------------------------
 #  Action selection with action masking
 # ------------------------------------------------------------
-def select_action(
-    net:           DQNetwork,
-    state:         np.ndarray,
-    valid_actions: list,
-    epsilon:       float,
-) -> int:
-    """
-    Epsilon-greedy policy with action masking.
-    Invalid actions are set to -inf so argmax always
-    selects a legal move when acting greedily.
-    """
+def select_action(net, state, valid, epsilon):
     if np.random.rand() < epsilon:
-        return random.choice(valid_actions)
-
-    q_vals = net.predict(state)               # (9,)
-    mask   = np.full(OUTPUT_SIZE, -np.inf)
-    mask[valid_actions] = q_vals[valid_actions]
+        return random.choice(valid)
+    q    = net.predict(state)
+    mask = np.full(OUTPUT_SIZE, -np.inf)
+    mask[valid] = q[valid]
     return int(np.argmax(mask))
 
 
@@ -340,114 +276,87 @@ def select_action(
 #  Training loop
 # ------------------------------------------------------------
 def train():
-    env = TicTacToeEnv()
-
-    # Online networks
-    net_X = DQNetwork()
-    net_O = DQNetwork()
-
-    # Target networks (periodically synced)
+    env      = TicTacToeEnv()
+    net_X    = DQNetwork()
+    net_O    = DQNetwork()
     target_X = copy.deepcopy(net_X)
     target_O = copy.deepcopy(net_O)
-
-    # Independent replay buffers
-    buf_X = ReplayBuffer()
-    buf_O = ReplayBuffer()
+    buf_X    = ReplayBuffer()
+    buf_O    = ReplayBuffer()
 
     epsilon = EPSILON_START
+    blk_wins_X = blk_wins_O = blk_ties = 0
+    blk_lX = blk_lO = 0.0
+    blk_sX = blk_sO = 0
 
-    # Block-level stats (reset every REPORT_FREQ epochs)
-    blk_wins_X  = 0
-    blk_wins_O  = 0
-    blk_ties    = 0
-    blk_loss_X  = 0.0
-    blk_loss_O  = 0.0
-    blk_steps   = 0    # gradient-step count in this block
-
-    # ── Header ───────────────────────────────────────────────
-    sep = "=" * 69
+    sep = "=" * 77
     print(sep)
-    print("  Dual-Agent DQN  –  Tic Tac Toe Self-Play Training")
-    print(f"  Epochs={EPOCHS}  |  gamma={DISCOUNT_FACTOR}  |  lr={LEARNING_RATE}  |  momentum={MOMENTUM}")
-    print(f"  Batch={MINI_BATCH_SIZE}  |  Buffer={BUFFER_CAPACITY}  |  Report every {REPORT_FREQ} epochs")
+    print("  Dual-Agent DQN  –  Tic Tac Toe (converging to ties)")
+    print(f"  Epochs={EPOCHS}  γ={DISCOUNT_FACTOR}  lr={LEARNING_RATE}  m={MOMENTUM}  clip={GRAD_CLIP}")
+    print(f"  Batch={MINI_BATCH_SIZE}  TargetSync every {TARGET_UPDATE_FREQ} eps")
+    print(f"  REWARD: Win={REWARD_WIN}  Tie={REWARD_TIE}  Lose={REWARD_LOSE}")
     print(sep)
-    print(
-        f"{'Epoch':>8}  {'Epsilon':>7}  "
-        f"{'X Wins':>7}  {'O Wins':>7}  {'Ties':>6}  "
-        f"{'Avg Loss X':>10}  {'Avg Loss O':>10}"
-    )
-    print("-" * 69)
+    print(f"{'Epoch':>8}  {'ε':>6}  {'X Wins':>7}  {'O Wins':>7}  {'Ties':>6}  {'Tie%':>6}  {'Loss X':>10}  {'Loss O':>10}")
+    print("-" * 77)
 
     for epoch in range(1, EPOCHS + 1):
-        state = env.reset()
+        raw = env.reset()
 
         while not env.done:
-            player  = env.current_player
-            net     = net_X    if player ==  1 else net_O
-            tgt_net = target_X if player ==  1 else target_O
-            buf     = buf_X    if player ==  1 else buf_O
+            p   = env.current_player
+            net = net_X    if p == 1 else net_O
+            tgt = target_X if p == 1 else target_O
+            buf = buf_X    if p == 1 else buf_O
 
+            state  = pov(raw, p)
             valid  = env.get_valid_actions()
             action = select_action(net, state, valid, epsilon)
 
-            next_state, rewards, done, info = env.step(action)
-            reward = rewards[player]
+            nxt_raw, rewards, done, info = env.step(action)
+            reward  = rewards[p]
+            nxt_pov = pov(nxt_raw, p)
 
-            # Store transition in the acting player's buffer
-            buf.add(state, action, reward, next_state, done)
+            buf.add(state, action, reward, nxt_pov, done)
 
-            # ── Learn from replay if buffer is ready ──────────
             if len(buf) >= MINI_BATCH_SIZE:
                 s_b, a_b, r_b, ns_b, d_b = buf.sample(MINI_BATCH_SIZE)
+                nq     = tgt.predict_batch(ns_b)
+                td_tgt = r_b + (1.0 - d_b) * DISCOUNT_FACTOR * np.max(nq, axis=1)
+                sl     = net.update_batch(s_b, a_b, td_tgt)
+                if p == 1: blk_lX += sl; blk_sX += 1
+                else:      blk_lO += sl; blk_sO += 1
 
-                # Bellman target using target network
-                nq      = tgt_net.predict_batch(ns_b)      # (B, 9)
-                max_nq  = np.max(nq, axis=1)               # (B,)
-                td_tgt  = r_b + (1.0 - d_b) * DISCOUNT_FACTOR * max_nq
+            raw = nxt_raw
 
-                step_loss = net.update_batch(s_b, a_b, td_tgt)
+        # Hard-copy target networks periodically
+        if epoch % TARGET_UPDATE_FREQ == 0:
+            target_X = copy.deepcopy(net_X)
+            target_O = copy.deepcopy(net_O)
 
-                if player == 1:
-                    blk_loss_X += step_loss
-                else:
-                    blk_loss_O += step_loss
-                blk_steps += 1
-
-            state = next_state
-
-        # ── Episode outcome ───────────────────────────────────
         w = env.winner
         if   w ==  1: blk_wins_X += 1
         elif w == -1: blk_wins_O += 1
         elif w ==  0: blk_ties   += 1
 
-        # ── Report every REPORT_FREQ epochs ──────────────────
         if epoch % REPORT_FREQ == 0:
-            avg_lX = blk_loss_X / max(blk_steps, 1)
-            avg_lO = blk_loss_O / max(blk_steps, 1)
+            total   = blk_wins_X + blk_wins_O + blk_ties
+            pct     = 100.0 * blk_ties / max(total, 1)
+            avg_lX  = blk_lX / max(blk_sX, 1)
+            avg_lO  = blk_lO / max(blk_sO, 1)
             print(
-                f"{epoch:>8}  {epsilon:>7.4f}  "
-                f"{blk_wins_X:>7}  {blk_wins_O:>7}  {blk_ties:>6}  "
+                f"{epoch:>8}  {epsilon:>6.4f}  "
+                f"{blk_wins_X:>7}  {blk_wins_O:>7}  {blk_ties:>6}  {pct:>5.1f}%  "
                 f"{avg_lX:>10.5f}  {avg_lO:>10.5f}"
             )
-            blk_wins_X = blk_wins_O = blk_ties = blk_steps = 0
-            blk_loss_X = blk_loss_O = 0.0
+            blk_wins_X = blk_wins_O = blk_ties = 0
+            blk_lX = blk_lO = 0.0; blk_sX = blk_sO = 0
 
-        # ── Epsilon decay ─────────────────────────────────────
         epsilon = max(EPSILON_MIN, epsilon * EPSILON_DECAY)
 
-        # ── Sync target networks ──────────────────────────────
-        if epoch % TARGET_UPDATE_FREQ == 0:
-            target_X = copy.deepcopy(net_X)
-            target_O = copy.deepcopy(net_O)
-
-    print("-" * 69)
+    print("-" * 77)
     print("Training complete.")
     return net_X, net_O
 
 
-# ------------------------------------------------------------
-#  Entry point
-# ------------------------------------------------------------
 if __name__ == "__main__":
     trained_X, trained_O = train()
